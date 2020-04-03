@@ -90,19 +90,21 @@ func (mw RoundTripMiddleware) Wrap(wrapMw RoundTripMiddleware) RoundTripMiddlewa
 
 // RoundTripMiddlewares allows configuring a RoundTripMiddleware for individual endpoints
 type RoundTripMiddlewares struct {
-	Issue127 RoundTripMiddleware
-	Issue30  RoundTripMiddleware
-	Issue41  RoundTripMiddleware
-	Issue9   RoundTripMiddleware
+	EnsureEverythingIsReferenced RoundTripMiddleware
+	Issue127                     RoundTripMiddleware
+	Issue30                      RoundTripMiddleware
+	Issue41                      RoundTripMiddleware
+	Issue9                       RoundTripMiddleware
 }
 
 // operationDoFunctions lets the client store Do functions using different
 // middleware for each operation
 type operationDoFunctions struct {
-	Issue127 DoFn
-	Issue30  DoFn
-	Issue41  DoFn
-	Issue9   DoFn
+	EnsureEverythingIsReferenced DoFn
+	Issue127                     DoFn
+	Issue30                      DoFn
+	Issue41                      DoFn
+	Issue9                       DoFn
 }
 
 // Client which conforms to the OpenAPI3 specification for this service.
@@ -135,7 +137,7 @@ type Client struct {
 // ClientOption allows setting custom parameters during construction
 type ClientOption func(*Client) error
 
-// Creates a new Client, with reasonable defaults
+// NewClient Creates a new Client, with reasonable defaults
 func NewClient(server string, opts ...ClientOption) (*Client, error) {
 	// create a client with sane default values
 	client := Client{
@@ -178,6 +180,13 @@ func setupOperationDoers(c *Client, rtMiddlewares RoundTripMiddlewares) *operati
 
 	operationDoers := operationDoFunctions{}
 
+	// EnsureEverythingIsReferenced
+	if rtMiddlewares.EnsureEverythingIsReferenced != nil {
+		mw := joinMiddleware(sharedMiddleware, rtMiddlewares.EnsureEverythingIsReferenced)
+		operationDoers.EnsureEverythingIsReferenced = mw.DoFn(c.Client.Do)
+	} else {
+		operationDoers.EnsureEverythingIsReferenced = sharedMiddleware.DoFn(c.Client.Do)
+	}
 	// Issue127
 	if rtMiddlewares.Issue127 != nil {
 		mw := joinMiddleware(sharedMiddleware, rtMiddlewares.Issue127)
@@ -247,6 +256,18 @@ func WithHTTPClient(doer HttpRequestDoer) ClientOption {
 	}
 }
 
+// WithBaseURL overrides the baseURL.
+func WithBaseURL(baseURL string) ClientOption {
+	return func(c *Client) error {
+		newBaseURL, err := url.Parse(baseURL)
+		if err != nil {
+			return err
+		}
+		c.Server = newBaseURL.String()
+		return nil
+	}
+}
+
 // WithRequestEditorFn allows setting up a callback function, which will be
 // called right before sending the request. This can be used to mutate the request.
 func WithRequestEditorFn(fn RequestEditorFn) ClientOption {
@@ -282,13 +303,7 @@ func (c *Client) EnsureEverythingIsReferenced(ctx context.Context) (*http.Respon
 		return nil, err
 	}
 	req = req.WithContext(ctx)
-	if c.RequestEditor != nil {
-		err = c.RequestEditor(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return c.Client.Do(req)
+	return c.operationDoers.EnsureEverythingIsReferenced(req)
 }
 
 func (c *Client) Issue127(ctx context.Context) (*http.Response, error) {
@@ -526,18 +541,6 @@ func NewClientWithResponses(server string, opts ...ClientOption) (*ClientWithRes
 		return nil, err
 	}
 	return &ClientWithResponses{client}, nil
-}
-
-// WithBaseURL overrides the baseURL.
-func WithBaseURL(baseURL string) ClientOption {
-	return func(c *Client) error {
-		newBaseURL, err := url.Parse(baseURL)
-		if err != nil {
-			return err
-		}
-		c.Server = newBaseURL.String()
-		return nil
-	}
 }
 
 // ClientWithResponsesInterface is the interface specification for the client with responses above.

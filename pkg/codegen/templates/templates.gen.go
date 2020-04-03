@@ -270,36 +270,42 @@ func {{$opid}}Ctx(next http.Handler) http.Handler {
 
 
 `,
-	"client-with-responses.tmpl": `// ClientWithResponses builds on ClientInterface to offer response payloads
-type ClientWithResponses struct {
-    ClientInterface
+	"client-with-responses.tmpl": `{{$clientWithResponses := "ClientWithResponses" -}}
+{{$clientWithResponsesInterface := "ClientWithResponsesInterface" -}}
+{{$newClientWithResponsesFn := "NewClientWithResponses" -}}
+{{if .PrivateClientWithResponses}}
+    {{$clientWithResponses = "clientWithResponses" -}}
+    {{$clientWithResponsesInterface = "clientWithResponsesInterface" -}}
+    {{$newClientWithResponsesFn = "newClientWithResponses" -}}
+{{end}}
+
+{{$clientInterface := "ClientInterface" -}}
+{{$clientOption := "ClientOption" -}}
+{{$newClientFn := "NewClient" -}}
+{{if .PrivateClient}}
+    {{$clientInterface = "clientInterface" -}}
+    {{$clientOption = "clientOption" -}}
+    {{$newClientFn = "newClient" -}}
+{{end}}
+
+// {{$clientWithResponses}} builds on {{$clientInterface}} to offer response payloads
+type {{$clientWithResponses}} struct {
+    {{$clientInterface}}
 }
 
-// NewClientWithResponses creates a new ClientWithResponses, which wraps
+// {{$newClientWithResponsesFn}} creates a new {{$clientWithResponses}}, which wraps
 // Client with return type handling
-func NewClientWithResponses(server string, opts ...ClientOption) (*ClientWithResponses, error) {
-    client, err := NewClient(server, opts...)
+func {{$newClientWithResponsesFn}}(server string, opts ...{{$clientOption}}) (*{{$clientWithResponses}}, error) {
+    client, err := {{$newClientFn}}(server, opts...)
     if err != nil {
         return nil, err
     }
-    return &ClientWithResponses{client}, nil
+    return &{{$clientWithResponses}}{client}, nil
 }
 
-// WithBaseURL overrides the baseURL.
-func WithBaseURL(baseURL string) ClientOption {
-	return func(c *Client) error {
-		newBaseURL, err := url.Parse(baseURL)
-		if err != nil {
-			return err
-		}
-		c.Server = newBaseURL.String()
-		return nil
-	}
-}
-
-// ClientWithResponsesInterface is the interface specification for the client with responses above.
-type ClientWithResponsesInterface interface {
-{{range . -}}
+// {{$clientWithResponsesInterface}} is the interface specification for the client with responses above.
+type {{$clientWithResponsesInterface}} interface {
+{{range .Operations -}}
 {{$hasParams := .RequiresParamObject -}}
 {{$pathParams := .PathParams -}}
 {{$opid := .OperationId -}}
@@ -308,10 +314,10 @@ type ClientWithResponsesInterface interface {
 {{range .Bodies}}
     {{$opid}}{{.Suffix}}WithResponse(ctx context.Context{{genParamArgs $pathParams}}{{if $hasParams}}, params *{{$opid}}Params{{end}}, body {{$opid}}{{.NameTag}}RequestBody) (*{{genResponseTypeName $opid}}, error)
 {{end}}{{/* range .Bodies */}}
-{{end}}{{/* range . $opid := .OperationId */}}
+{{end}}{{/* range .Operations $opid := .OperationId */}}
 }
 
-{{range .}}{{$opid := .OperationId}}{{$op := .}}
+{{range .Operations}}{{$opid := .OperationId}}{{$op := .}}
 type {{$opid | ucFirst}}Response struct {
     Body         []byte
 	HTTPResponse *http.Response
@@ -338,12 +344,12 @@ func (r {{$opid | ucFirst}}Response) StatusCode() int {
 {{end}}
 
 
-{{range .}}
+{{range .Operations -}}
 {{$opid := .OperationId -}}
 {{/* Generate client methods (with responses)*/}}
 
 // {{$opid}}{{if .HasBody}}WithBody{{end}}WithResponse request{{if .HasBody}} with arbitrary body{{end}} returning *{{$opid}}Response
-func (c *ClientWithResponses) {{$opid}}{{if .HasBody}}WithBody{{end}}WithResponse(ctx context.Context{{genParamArgs .PathParams}}{{if .RequiresParamObject}}, params *{{$opid}}Params{{end}}{{if .HasBody}}, contentType string, body io.Reader{{end}}) (*{{genResponseTypeName $opid}}, error){
+func (c *{{$clientWithResponses}}) {{$opid}}{{if .HasBody}}WithBody{{end}}WithResponse(ctx context.Context{{genParamArgs .PathParams}}{{if .RequiresParamObject}}, params *{{$opid}}Params{{end}}{{if .HasBody}}, contentType string, body io.Reader{{end}}) (*{{genResponseTypeName $opid}}, error){
     rsp, err := c.{{$opid}}{{if .HasBody}}WithBody{{end}}(ctx{{genParamNames .PathParams}}{{if .RequiresParamObject}}, params{{end}}{{if .HasBody}}, contentType, body{{end}})
     if err != nil {
         return nil, err
@@ -355,7 +361,7 @@ func (c *ClientWithResponses) {{$opid}}{{if .HasBody}}WithBody{{end}}WithRespons
 {{$pathParams := .PathParams -}}
 {{$bodyRequired := .BodyRequired -}}
 {{range .Bodies}}
-func (c *ClientWithResponses) {{$opid}}{{.Suffix}}WithResponse(ctx context.Context{{genParamArgs $pathParams}}{{if $hasParams}}, params *{{$opid}}Params{{end}}, body {{$opid}}{{.NameTag}}RequestBody) (*{{genResponseTypeName $opid}}, error) {
+func (c *{{$clientWithResponses}}) {{$opid}}{{.Suffix}}WithResponse(ctx context.Context{{genParamArgs $pathParams}}{{if $hasParams}}, params *{{$opid}}Params{{end}}, body {{$opid}}{{.NameTag}}RequestBody) (*{{genResponseTypeName $opid}}, error) {
     rsp, err := c.{{$opid}}{{.Suffix}}(ctx{{genParamNames $pathParams}}{{if $hasParams}}, params{{end}}, body)
     if err != nil {
         return nil, err
@@ -367,7 +373,7 @@ func (c *ClientWithResponses) {{$opid}}{{.Suffix}}WithResponse(ctx context.Conte
 {{end}}{{/* operations */}}
 
 {{/* Generate parse functions for responses*/}}
-{{range .}}{{$opid := .OperationId}}
+{{range .Operations}}{{$opid := .OperationId}}
 
 // Parse{{genResponseTypeName $opid | ucFirst}} parses an HTTP response from a {{$opid}}WithResponse call
 func Parse{{genResponseTypeName $opid | ucFirst}}(rsp *http.Response) (*{{genResponseTypeName $opid}}, error) {
@@ -383,10 +389,22 @@ func Parse{{genResponseTypeName $opid | ucFirst}}(rsp *http.Response) (*{{genRes
 
     return response, nil
 }
-{{end}}{{/* range . $opid := .OperationId */}}
+{{end}}{{/* range .Operations $opid := .OperationId */}}
 
 `,
-	"client.tmpl": `// RequestEditorFn  is the function signature for the RequestEditor callback function
+	"client.tmpl": `
+{{$clientStruct := "Client" -}}
+{{$clientInterface := "ClientInterface" -}}
+{{$newClientFn := "NewClient" -}}
+{{$clientOption := "ClientOption" -}}
+{{if .PrivateClientWithResponses}}
+    {{$clientStruct = "client" -}}
+    {{$clientInterface = "clientInterface" -}}
+    {{$newClientFn = "newClient" -}}
+    {{$clientOption = "clientOption" -}}
+{{end}}
+
+// RequestEditorFn  is the function signature for the RequestEditor callback function
 type RequestEditorFn func(ctx context.Context, req *http.Request) error
 
 // Doer performs HTTP requests.
@@ -428,7 +446,7 @@ func (mw RoundTripMiddleware) Wrap(wrapMw RoundTripMiddleware) RoundTripMiddlewa
 
 // RoundTripMiddlewares allows configuring a RoundTripMiddleware for individual endpoints
 type RoundTripMiddlewares struct {
-{{range . -}}
+{{range .Operations -}}
 {{$opid := .OperationId -}}
     {{$opid}} RoundTripMiddleware
 {{end}}
@@ -437,14 +455,14 @@ type RoundTripMiddlewares struct {
 // operationDoFunctions lets the client store Do functions using different
 // middleware for each operation
 type operationDoFunctions struct {
-{{range . -}}
+{{range .Operations -}}
 {{$opid := .OperationId -}}
     {{$opid}} DoFn
 {{end}}
 }
 
-// Client which conforms to the OpenAPI3 specification for this service.
-type Client struct {
+// {{$clientStruct}} which conforms to the OpenAPI3 specification for this service.
+type {{$clientStruct}} struct {
 	// The endpoint of the server conforming to this interface, with scheme,
 	// https://api.deepmap.com for example.
 	Server string
@@ -470,13 +488,13 @@ type Client struct {
 	operationDoers *operationDoFunctions
 }
 
-// ClientOption allows setting custom parameters during construction
-type ClientOption func(*Client) error
+// {{$clientOption}} allows setting custom parameters during construction
+type {{$clientOption}} func(*{{$clientStruct}}) error
 
-// Creates a new Client, with reasonable defaults
-func NewClient(server string, opts ...ClientOption) (*Client, error) {
+// {{$newClientFn}} Creates a new Client, with reasonable defaults
+func {{$newClientFn}}(server string, opts ...{{$clientOption}}) (*{{$clientStruct}}, error) {
     // create a client with sane default values
-    client := Client{
+    client := {{$clientStruct}}{
         Server: server,
     }
     // mutate client and add all optional params
@@ -499,7 +517,7 @@ func NewClient(server string, opts ...ClientOption) (*Client, error) {
     return &client, nil
 }
 
-func setupOperationDoers(c *Client, rtMiddlewares RoundTripMiddlewares) *operationDoFunctions {
+func setupOperationDoers(c *{{$clientStruct}}, rtMiddlewares RoundTripMiddlewares) *operationDoFunctions {
 
 	sharedMiddlewares := []RoundTripMiddleware{}
 
@@ -516,7 +534,7 @@ func setupOperationDoers(c *Client, rtMiddlewares RoundTripMiddlewares) *operati
 
 	operationDoers := operationDoFunctions{}
 
-{{range . -}}
+{{range .Operations -}}
 {{$opid := .OperationId -}}
 	// {{$opid}}
 	if rtMiddlewares.{{$opid}} != nil {
@@ -543,7 +561,7 @@ func newRequestEditorMiddleware(requestEditorFn RequestEditorFn) RoundTripMiddle
 }
 
 // WithSharedRoundTripMiddleware add a middleware that applies to all routes
-func WithSharedRoundTripMiddleware(rtm RoundTripMiddleware) ClientOption {
+func WithSharedRoundTripMiddleware(rtm RoundTripMiddleware) {{$clientOption}} {
 	return func(c *Client) error {
 		c.SharedRoundTripMiddleware = rtm
 		return nil
@@ -551,7 +569,7 @@ func WithSharedRoundTripMiddleware(rtm RoundTripMiddleware) ClientOption {
 }
 
 // WithRoundTripMiddlewares Add middlewares that apply to specific routes
-func WithRoundTripMiddlewares(rtMiddlewares RoundTripMiddlewares) ClientOption {
+func WithRoundTripMiddlewares(rtMiddlewares RoundTripMiddlewares) {{$clientOption}} {
 	return func(c *Client) error {
 		c.RoundTripMiddlewares = rtMiddlewares
 		return nil
@@ -560,25 +578,37 @@ func WithRoundTripMiddlewares(rtMiddlewares RoundTripMiddlewares) ClientOption {
 
 // WithHTTPClient allows overriding the default Doer, which is
 // automatically created using http.Client. This is useful for tests.
-func WithHTTPClient(doer HttpRequestDoer) ClientOption {
-	return func(c *Client) error {
+func WithHTTPClient(doer HttpRequestDoer) {{$clientOption}} {
+	return func(c *{{$clientStruct}}) error {
 		c.Client = doer
+		return nil
+	}
+}
+
+// WithBaseURL overrides the baseURL.
+func WithBaseURL(baseURL string) {{$clientOption}} {
+	return func(c *{{$clientStruct}}) error {
+		newBaseURL, err := url.Parse(baseURL)
+		if err != nil {
+			return err
+		}
+		c.Server = newBaseURL.String()
 		return nil
 	}
 }
 
 // WithRequestEditorFn allows setting up a callback function, which will be
 // called right before sending the request. This can be used to mutate the request.
-func WithRequestEditorFn(fn RequestEditorFn) ClientOption {
-	return func(c *Client) error {
+func WithRequestEditorFn(fn RequestEditorFn) {{$clientOption}} {
+	return func(c *{{$clientStruct}}) error {
 		c.RequestEditor = fn
 		return nil
 	}
 }
 
 // The interface specification for the client above.
-type ClientInterface interface {
-{{range . -}}
+type {{$clientInterface}} interface {
+{{range .Operations -}}
 {{$hasParams := .RequiresParamObject -}}
 {{$pathParams := .PathParams -}}
 {{$opid := .OperationId -}}
@@ -587,17 +617,17 @@ type ClientInterface interface {
 {{range .Bodies}}
     {{$opid}}{{.Suffix}}(ctx context.Context{{genParamArgs $pathParams}}{{if $hasParams}}, params *{{$opid}}Params{{end}}, body {{$opid}}{{.NameTag}}RequestBody) (*http.Response, error)
 {{end}}{{/* range .Bodies */}}
-{{end}}{{/* range . $opid := .OperationId */}}
+{{end}}{{/* range .Operations $opid := .OperationId */}}
 }
 
 
 {{/* Generate client methods */}}
-{{range . -}}
+{{range .Operations -}}
 {{$hasParams := .RequiresParamObject -}}
 {{$pathParams := .PathParams -}}
 {{$opid := .OperationId -}}
 
-func (c *Client) {{$opid}}{{if .HasBody}}WithBody{{end}}(ctx context.Context{{genParamArgs $pathParams}}{{if $hasParams}}, params *{{$opid}}Params{{end}}{{if .HasBody}}, contentType string, body io.Reader{{end}}) (*http.Response, error) {
+func (c *{{$clientStruct}}) {{$opid}}{{if .HasBody}}WithBody{{end}}(ctx context.Context{{genParamArgs $pathParams}}{{if $hasParams}}, params *{{$opid}}Params{{end}}{{if .HasBody}}, contentType string, body io.Reader{{end}}) (*http.Response, error) {
     req, err := New{{$opid}}Request{{if .HasBody}}WithBody{{end}}(c.Server{{genParamNames .PathParams}}{{if $hasParams}}, params{{end}}{{if .HasBody}}, contentType, body{{end}})
     if err != nil {
         return nil, err
@@ -607,7 +637,7 @@ func (c *Client) {{$opid}}{{if .HasBody}}WithBody{{end}}(ctx context.Context{{ge
 }
 
 {{range .Bodies}}
-func (c *Client) {{$opid}}{{.Suffix}}(ctx context.Context{{genParamArgs $pathParams}}{{if $hasParams}}, params *{{$opid}}Params{{end}}, body {{$opid}}{{.NameTag}}RequestBody) (*http.Response, error) {
+func (c *{{$clientStruct}}) {{$opid}}{{.Suffix}}(ctx context.Context{{genParamArgs $pathParams}}{{if $hasParams}}, params *{{$opid}}Params{{end}}, body {{$opid}}{{.NameTag}}RequestBody) (*http.Response, error) {
     req, err := New{{$opid}}{{.Suffix}}Request(c.Server{{genParamNames $pathParams}}{{if $hasParams}}, params{{end}}, body)
     if err != nil {
         return nil, err
@@ -619,7 +649,7 @@ func (c *Client) {{$opid}}{{.Suffix}}(ctx context.Context{{genParamArgs $pathPar
 {{end}}
 
 {{/* Generate request builders */}}
-{{range .}}
+{{range .Operations}}
 {{$hasParams := .RequiresParamObject -}}
 {{$pathParams := .PathParams -}}
 {{$bodyRequired := .BodyRequired -}}
