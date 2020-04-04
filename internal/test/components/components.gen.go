@@ -729,6 +729,51 @@ type HttpRequestDoer interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
+type DoFn func(r *http.Request) (*http.Response, error)
+
+// RoundTripMiddleware lets you define functions that can intercept and manipulate
+// the round trip of a single HTTP transaction
+type RoundTripMiddleware func(next DoFn) DoFn
+
+// DoFn returns the result of applying the middleware to the provided DoFn
+func (rtm RoundTripMiddleware) DoFn(doFn DoFn) DoFn {
+	return rtm(doFn)
+}
+
+func joinMiddleware(mw ...RoundTripMiddleware) RoundTripMiddleware {
+	if len(mw) < 1 {
+		return func(doFn DoFn) DoFn {
+			return doFn
+		}
+	}
+	middleware := mw[len(mw)-1]
+	for i := len(mw) - 2; i >= 0; i-- {
+		middleware = middleware.Wrap(mw[i])
+	}
+	return middleware
+}
+
+func (mw RoundTripMiddleware) Wrap(wrapMw RoundTripMiddleware) RoundTripMiddleware {
+	return func(doFn DoFn) DoFn {
+		return wrapMw(mw(doFn))
+	}
+}
+
+// RoundTripMiddlewares allows configuring a RoundTripMiddleware for individual endpoints
+type RoundTripMiddlewares struct {
+	EnsureEverythingIsReferenced RoundTripMiddleware
+	ParamsWithAddProps           RoundTripMiddleware
+	BodyWithAddProps             RoundTripMiddleware
+}
+
+// operationDoFunctions lets the client store Do functions using different
+// middleware for each operation
+type operationDoFunctions struct {
+	EnsureEverythingIsReferenced DoFn
+	ParamsWithAddProps           DoFn
+	BodyWithAddProps             DoFn
+}
+
 // Client which conforms to the OpenAPI3 specification for this service.
 type Client struct {
 	// The endpoint of the server conforming to this interface, with scheme,
@@ -742,12 +787,26 @@ type Client struct {
 	// A callback for modifying requests which are generated before sending over
 	// the network.
 	RequestEditor RequestEditorFn
+
+	// SharedRoundTripMiddleware lets you apply a RoundTripMiddleware on all
+	// operations.
+	SharedRoundTripMiddleware RoundTripMiddleware
+
+	// RoundTripMiddlewares lets you apply a RoundTripMiddleware on specific
+	// operations.
+	RoundTripMiddlewares RoundTripMiddlewares
+
+	// operationDoers is the set of Do functions for each operation that is created
+	// for the client.
+	operationDoers *operationDoFunctions
 }
+
+var _ ClientInterface = &Client{}
 
 // ClientOption allows setting custom parameters during construction
 type ClientOption func(*Client) error
 
-// Creates a new Client, with reasonable defaults
+// NewClient Creates a new Client, with reasonable defaults
 func NewClient(server string, opts ...ClientOption) (*Client, error) {
 	// create a client with sane default values
 	client := Client{
@@ -767,7 +826,80 @@ func NewClient(server string, opts ...ClientOption) (*Client, error) {
 	if client.Client == nil {
 		client.Client = http.DefaultClient
 	}
+
+	client.operationDoers = setupOperationDoers(&client, client.RoundTripMiddlewares)
+
 	return &client, nil
+}
+
+func setupOperationDoers(c *Client, rtMiddlewares RoundTripMiddlewares) *operationDoFunctions {
+
+	sharedMiddlewares := []RoundTripMiddleware{}
+
+	if c.RequestEditor != nil {
+		mw := newRequestEditorMiddleware(c.RequestEditor)
+		sharedMiddlewares = append(sharedMiddlewares, mw)
+	}
+
+	if c.SharedRoundTripMiddleware != nil {
+		sharedMiddlewares = append(sharedMiddlewares, c.SharedRoundTripMiddleware)
+	}
+
+	sharedMiddleware := joinMiddleware(sharedMiddlewares...)
+
+	operationDoers := operationDoFunctions{}
+
+	// EnsureEverythingIsReferenced
+	if rtMiddlewares.EnsureEverythingIsReferenced != nil {
+		mw := joinMiddleware(sharedMiddleware, rtMiddlewares.EnsureEverythingIsReferenced)
+		operationDoers.EnsureEverythingIsReferenced = mw.DoFn(c.Client.Do)
+	} else {
+		operationDoers.EnsureEverythingIsReferenced = sharedMiddleware.DoFn(c.Client.Do)
+	}
+	// ParamsWithAddProps
+	if rtMiddlewares.ParamsWithAddProps != nil {
+		mw := joinMiddleware(sharedMiddleware, rtMiddlewares.ParamsWithAddProps)
+		operationDoers.ParamsWithAddProps = mw.DoFn(c.Client.Do)
+	} else {
+		operationDoers.ParamsWithAddProps = sharedMiddleware.DoFn(c.Client.Do)
+	}
+	// BodyWithAddProps
+	if rtMiddlewares.BodyWithAddProps != nil {
+		mw := joinMiddleware(sharedMiddleware, rtMiddlewares.BodyWithAddProps)
+		operationDoers.BodyWithAddProps = mw.DoFn(c.Client.Do)
+	} else {
+		operationDoers.BodyWithAddProps = sharedMiddleware.DoFn(c.Client.Do)
+	}
+
+	return &operationDoers
+}
+
+func newRequestEditorMiddleware(requestEditorFn RequestEditorFn) RoundTripMiddleware {
+	return func(next DoFn) DoFn {
+		return func(r *http.Request) (*http.Response, error) {
+			err := requestEditorFn(r.Context(), r)
+			if err != nil {
+				return nil, err
+			}
+			return next(r)
+		}
+	}
+}
+
+// WithSharedRoundTripMiddleware add a middleware that applies to all routes
+func WithSharedRoundTripMiddleware(rtm RoundTripMiddleware) ClientOption {
+	return func(c *Client) error {
+		c.SharedRoundTripMiddleware = rtm
+		return nil
+	}
+}
+
+// WithRoundTripMiddlewares Add middlewares that apply to specific routes
+func WithRoundTripMiddlewares(rtMiddlewares RoundTripMiddlewares) ClientOption {
+	return func(c *Client) error {
+		c.RoundTripMiddlewares = rtMiddlewares
+		return nil
+	}
 }
 
 // WithHTTPClient allows overriding the default Doer, which is
@@ -775,6 +907,18 @@ func NewClient(server string, opts ...ClientOption) (*Client, error) {
 func WithHTTPClient(doer HttpRequestDoer) ClientOption {
 	return func(c *Client) error {
 		c.Client = doer
+		return nil
+	}
+}
+
+// WithBaseURL overrides the baseURL.
+func WithBaseURL(baseURL string) ClientOption {
+	return func(c *Client) error {
+		newBaseURL, err := url.Parse(baseURL)
+		if err != nil {
+			return err
+		}
+		c.Server = newBaseURL.String()
 		return nil
 	}
 }
@@ -790,18 +934,30 @@ func WithRequestEditorFn(fn RequestEditorFn) ClientOption {
 
 // The interface specification for the client above.
 type ClientInterface interface {
-	// EnsureEverythingIsReferenced request  with any body
+	// EnsureEverythingIsReferencedWithBody request  with any body
 	EnsureEverythingIsReferencedWithBody(ctx context.Context, contentType string, body io.Reader) (*http.Response, error)
+	// EnsureEverythingIsReferencedWithBodyWithResponse request  with any body and parse response
+	EnsureEverythingIsReferencedWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader) (*EnsureEverythingIsReferencedResponse, error)
 
+	// EnsureEverythingIsReferenced
 	EnsureEverythingIsReferenced(ctx context.Context, body EnsureEverythingIsReferencedJSONRequestBody) (*http.Response, error)
+	// EnsureEverythingIsReferencedWithResponse
+	EnsureEverythingIsReferencedWithResponse(ctx context.Context, body EnsureEverythingIsReferencedJSONRequestBody) (*EnsureEverythingIsReferencedResponse, error)
 
 	// ParamsWithAddProps request
 	ParamsWithAddProps(ctx context.Context, params *ParamsWithAddPropsParams) (*http.Response, error)
+	// ParamsWithAddPropsWithResponse request  and parse response
+	ParamsWithAddPropsWithResponse(ctx context.Context, params *ParamsWithAddPropsParams) (*ParamsWithAddPropsResponse, error)
 
-	// BodyWithAddProps request  with any body
+	// BodyWithAddPropsWithBody request  with any body
 	BodyWithAddPropsWithBody(ctx context.Context, contentType string, body io.Reader) (*http.Response, error)
+	// BodyWithAddPropsWithBodyWithResponse request  with any body and parse response
+	BodyWithAddPropsWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader) (*BodyWithAddPropsResponse, error)
 
+	// BodyWithAddProps
 	BodyWithAddProps(ctx context.Context, body BodyWithAddPropsJSONRequestBody) (*http.Response, error)
+	// BodyWithAddPropsWithResponse
+	BodyWithAddPropsWithResponse(ctx context.Context, body BodyWithAddPropsJSONRequestBody) (*BodyWithAddPropsResponse, error)
 }
 
 func (c *Client) EnsureEverythingIsReferencedWithBody(ctx context.Context, contentType string, body io.Reader) (*http.Response, error) {
@@ -810,13 +966,7 @@ func (c *Client) EnsureEverythingIsReferencedWithBody(ctx context.Context, conte
 		return nil, err
 	}
 	req = req.WithContext(ctx)
-	if c.RequestEditor != nil {
-		err = c.RequestEditor(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return c.Client.Do(req)
+	return c.operationDoers.EnsureEverythingIsReferenced(req)
 }
 
 func (c *Client) EnsureEverythingIsReferenced(ctx context.Context, body EnsureEverythingIsReferencedJSONRequestBody) (*http.Response, error) {
@@ -825,13 +975,7 @@ func (c *Client) EnsureEverythingIsReferenced(ctx context.Context, body EnsureEv
 		return nil, err
 	}
 	req = req.WithContext(ctx)
-	if c.RequestEditor != nil {
-		err = c.RequestEditor(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return c.Client.Do(req)
+	return c.operationDoers.EnsureEverythingIsReferenced(req)
 }
 
 func (c *Client) ParamsWithAddProps(ctx context.Context, params *ParamsWithAddPropsParams) (*http.Response, error) {
@@ -840,13 +984,7 @@ func (c *Client) ParamsWithAddProps(ctx context.Context, params *ParamsWithAddPr
 		return nil, err
 	}
 	req = req.WithContext(ctx)
-	if c.RequestEditor != nil {
-		err = c.RequestEditor(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return c.Client.Do(req)
+	return c.operationDoers.ParamsWithAddProps(req)
 }
 
 func (c *Client) BodyWithAddPropsWithBody(ctx context.Context, contentType string, body io.Reader) (*http.Response, error) {
@@ -855,13 +993,7 @@ func (c *Client) BodyWithAddPropsWithBody(ctx context.Context, contentType strin
 		return nil, err
 	}
 	req = req.WithContext(ctx)
-	if c.RequestEditor != nil {
-		err = c.RequestEditor(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return c.Client.Do(req)
+	return c.operationDoers.BodyWithAddProps(req)
 }
 
 func (c *Client) BodyWithAddProps(ctx context.Context, body BodyWithAddPropsJSONRequestBody) (*http.Response, error) {
@@ -870,13 +1002,7 @@ func (c *Client) BodyWithAddProps(ctx context.Context, body BodyWithAddPropsJSON
 		return nil, err
 	}
 	req = req.WithContext(ctx)
-	if c.RequestEditor != nil {
-		err = c.RequestEditor(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return c.Client.Do(req)
+	return c.operationDoers.BodyWithAddProps(req)
 }
 
 // NewEnsureEverythingIsReferencedRequest calls the generic EnsureEverythingIsReferenced builder with application/json body
@@ -1012,34 +1138,7 @@ func NewBodyWithAddPropsRequestWithBody(server string, contentType string, body 
 	return req, nil
 }
 
-// ClientWithResponses builds on ClientInterface to offer response payloads
-type ClientWithResponses struct {
-	ClientInterface
-}
-
-// NewClientWithResponses creates a new ClientWithResponses, which wraps
-// Client with return type handling
-func NewClientWithResponses(server string, opts ...ClientOption) (*ClientWithResponses, error) {
-	client, err := NewClient(server, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return &ClientWithResponses{client}, nil
-}
-
-// WithBaseURL overrides the baseURL.
-func WithBaseURL(baseURL string) ClientOption {
-	return func(c *Client) error {
-		newBaseURL, err := url.Parse(baseURL)
-		if err != nil {
-			return err
-		}
-		c.Server = newBaseURL.String()
-		return nil
-	}
-}
-
-type ensureEverythingIsReferencedResponse struct {
+type EnsureEverythingIsReferencedResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
 	JSON200      *struct {
@@ -1066,7 +1165,7 @@ type ensureEverythingIsReferencedResponse struct {
 }
 
 // Status returns HTTPResponse.Status
-func (r ensureEverythingIsReferencedResponse) Status() string {
+func (r EnsureEverythingIsReferencedResponse) Status() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Status
 	}
@@ -1074,20 +1173,20 @@ func (r ensureEverythingIsReferencedResponse) Status() string {
 }
 
 // StatusCode returns HTTPResponse.StatusCode
-func (r ensureEverythingIsReferencedResponse) StatusCode() int {
+func (r EnsureEverythingIsReferencedResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
 	return 0
 }
 
-type paramsWithAddPropsResponse struct {
+type ParamsWithAddPropsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
 }
 
 // Status returns HTTPResponse.Status
-func (r paramsWithAddPropsResponse) Status() string {
+func (r ParamsWithAddPropsResponse) Status() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Status
 	}
@@ -1095,20 +1194,20 @@ func (r paramsWithAddPropsResponse) Status() string {
 }
 
 // StatusCode returns HTTPResponse.StatusCode
-func (r paramsWithAddPropsResponse) StatusCode() int {
+func (r ParamsWithAddPropsResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
 	return 0
 }
 
-type bodyWithAddPropsResponse struct {
+type BodyWithAddPropsResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
 }
 
 // Status returns HTTPResponse.Status
-func (r bodyWithAddPropsResponse) Status() string {
+func (r BodyWithAddPropsResponse) Status() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Status
 	}
@@ -1116,7 +1215,7 @@ func (r bodyWithAddPropsResponse) Status() string {
 }
 
 // StatusCode returns HTTPResponse.StatusCode
-func (r bodyWithAddPropsResponse) StatusCode() int {
+func (r BodyWithAddPropsResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -1124,7 +1223,7 @@ func (r bodyWithAddPropsResponse) StatusCode() int {
 }
 
 // EnsureEverythingIsReferencedWithBodyWithResponse request with arbitrary body returning *EnsureEverythingIsReferencedResponse
-func (c *ClientWithResponses) EnsureEverythingIsReferencedWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader) (*ensureEverythingIsReferencedResponse, error) {
+func (c *Client) EnsureEverythingIsReferencedWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader) (*EnsureEverythingIsReferencedResponse, error) {
 	rsp, err := c.EnsureEverythingIsReferencedWithBody(ctx, contentType, body)
 	if err != nil {
 		return nil, err
@@ -1132,7 +1231,7 @@ func (c *ClientWithResponses) EnsureEverythingIsReferencedWithBodyWithResponse(c
 	return ParseEnsureEverythingIsReferencedResponse(rsp)
 }
 
-func (c *ClientWithResponses) EnsureEverythingIsReferencedWithResponse(ctx context.Context, body EnsureEverythingIsReferencedJSONRequestBody) (*ensureEverythingIsReferencedResponse, error) {
+func (c *Client) EnsureEverythingIsReferencedWithResponse(ctx context.Context, body EnsureEverythingIsReferencedJSONRequestBody) (*EnsureEverythingIsReferencedResponse, error) {
 	rsp, err := c.EnsureEverythingIsReferenced(ctx, body)
 	if err != nil {
 		return nil, err
@@ -1141,7 +1240,7 @@ func (c *ClientWithResponses) EnsureEverythingIsReferencedWithResponse(ctx conte
 }
 
 // ParamsWithAddPropsWithResponse request returning *ParamsWithAddPropsResponse
-func (c *ClientWithResponses) ParamsWithAddPropsWithResponse(ctx context.Context, params *ParamsWithAddPropsParams) (*paramsWithAddPropsResponse, error) {
+func (c *Client) ParamsWithAddPropsWithResponse(ctx context.Context, params *ParamsWithAddPropsParams) (*ParamsWithAddPropsResponse, error) {
 	rsp, err := c.ParamsWithAddProps(ctx, params)
 	if err != nil {
 		return nil, err
@@ -1150,7 +1249,7 @@ func (c *ClientWithResponses) ParamsWithAddPropsWithResponse(ctx context.Context
 }
 
 // BodyWithAddPropsWithBodyWithResponse request with arbitrary body returning *BodyWithAddPropsResponse
-func (c *ClientWithResponses) BodyWithAddPropsWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader) (*bodyWithAddPropsResponse, error) {
+func (c *Client) BodyWithAddPropsWithBodyWithResponse(ctx context.Context, contentType string, body io.Reader) (*BodyWithAddPropsResponse, error) {
 	rsp, err := c.BodyWithAddPropsWithBody(ctx, contentType, body)
 	if err != nil {
 		return nil, err
@@ -1158,7 +1257,7 @@ func (c *ClientWithResponses) BodyWithAddPropsWithBodyWithResponse(ctx context.C
 	return ParseBodyWithAddPropsResponse(rsp)
 }
 
-func (c *ClientWithResponses) BodyWithAddPropsWithResponse(ctx context.Context, body BodyWithAddPropsJSONRequestBody) (*bodyWithAddPropsResponse, error) {
+func (c *Client) BodyWithAddPropsWithResponse(ctx context.Context, body BodyWithAddPropsJSONRequestBody) (*BodyWithAddPropsResponse, error) {
 	rsp, err := c.BodyWithAddProps(ctx, body)
 	if err != nil {
 		return nil, err
@@ -1167,14 +1266,14 @@ func (c *ClientWithResponses) BodyWithAddPropsWithResponse(ctx context.Context, 
 }
 
 // ParseEnsureEverythingIsReferencedResponse parses an HTTP response from a EnsureEverythingIsReferencedWithResponse call
-func ParseEnsureEverythingIsReferencedResponse(rsp *http.Response) (*ensureEverythingIsReferencedResponse, error) {
+func ParseEnsureEverythingIsReferencedResponse(rsp *http.Response) (*EnsureEverythingIsReferencedResponse, error) {
 	bodyBytes, err := ioutil.ReadAll(rsp.Body)
 	defer rsp.Body.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	response := &ensureEverythingIsReferencedResponse{
+	response := &EnsureEverythingIsReferencedResponse{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}
@@ -1222,14 +1321,14 @@ func ParseEnsureEverythingIsReferencedResponse(rsp *http.Response) (*ensureEvery
 }
 
 // ParseParamsWithAddPropsResponse parses an HTTP response from a ParamsWithAddPropsWithResponse call
-func ParseParamsWithAddPropsResponse(rsp *http.Response) (*paramsWithAddPropsResponse, error) {
+func ParseParamsWithAddPropsResponse(rsp *http.Response) (*ParamsWithAddPropsResponse, error) {
 	bodyBytes, err := ioutil.ReadAll(rsp.Body)
 	defer rsp.Body.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	response := &paramsWithAddPropsResponse{
+	response := &ParamsWithAddPropsResponse{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}
@@ -1241,14 +1340,14 @@ func ParseParamsWithAddPropsResponse(rsp *http.Response) (*paramsWithAddPropsRes
 }
 
 // ParseBodyWithAddPropsResponse parses an HTTP response from a BodyWithAddPropsWithResponse call
-func ParseBodyWithAddPropsResponse(rsp *http.Response) (*bodyWithAddPropsResponse, error) {
+func ParseBodyWithAddPropsResponse(rsp *http.Response) (*BodyWithAddPropsResponse, error) {
 	bodyBytes, err := ioutil.ReadAll(rsp.Body)
 	defer rsp.Body.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	response := &bodyWithAddPropsResponse{
+	response := &BodyWithAddPropsResponse{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}

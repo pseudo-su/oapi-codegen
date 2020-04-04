@@ -58,6 +58,55 @@ type HttpRequestDoer interface {
 	Do(req *http.Request) (*http.Response, error)
 }
 
+type DoFn func(r *http.Request) (*http.Response, error)
+
+// RoundTripMiddleware lets you define functions that can intercept and manipulate
+// the round trip of a single HTTP transaction
+type RoundTripMiddleware func(next DoFn) DoFn
+
+// DoFn returns the result of applying the middleware to the provided DoFn
+func (rtm RoundTripMiddleware) DoFn(doFn DoFn) DoFn {
+	return rtm(doFn)
+}
+
+func joinMiddleware(mw ...RoundTripMiddleware) RoundTripMiddleware {
+	if len(mw) < 1 {
+		return func(doFn DoFn) DoFn {
+			return doFn
+		}
+	}
+	middleware := mw[len(mw)-1]
+	for i := len(mw) - 2; i >= 0; i-- {
+		middleware = middleware.Wrap(mw[i])
+	}
+	return middleware
+}
+
+func (mw RoundTripMiddleware) Wrap(wrapMw RoundTripMiddleware) RoundTripMiddleware {
+	return func(doFn DoFn) DoFn {
+		return wrapMw(mw(doFn))
+	}
+}
+
+// RoundTripMiddlewares allows configuring a RoundTripMiddleware for individual endpoints
+type RoundTripMiddlewares struct {
+	EnsureEverythingIsReferenced RoundTripMiddleware
+	Issue127                     RoundTripMiddleware
+	Issue30                      RoundTripMiddleware
+	Issue41                      RoundTripMiddleware
+	Issue9                       RoundTripMiddleware
+}
+
+// operationDoFunctions lets the client store Do functions using different
+// middleware for each operation
+type operationDoFunctions struct {
+	EnsureEverythingIsReferenced DoFn
+	Issue127                     DoFn
+	Issue30                      DoFn
+	Issue41                      DoFn
+	Issue9                       DoFn
+}
+
 // Client which conforms to the OpenAPI3 specification for this service.
 type Client struct {
 	// The endpoint of the server conforming to this interface, with scheme,
@@ -71,12 +120,26 @@ type Client struct {
 	// A callback for modifying requests which are generated before sending over
 	// the network.
 	RequestEditor RequestEditorFn
+
+	// SharedRoundTripMiddleware lets you apply a RoundTripMiddleware on all
+	// operations.
+	SharedRoundTripMiddleware RoundTripMiddleware
+
+	// RoundTripMiddlewares lets you apply a RoundTripMiddleware on specific
+	// operations.
+	RoundTripMiddlewares RoundTripMiddlewares
+
+	// operationDoers is the set of Do functions for each operation that is created
+	// for the client.
+	operationDoers *operationDoFunctions
 }
+
+var _ ClientInterface = &Client{}
 
 // ClientOption allows setting custom parameters during construction
 type ClientOption func(*Client) error
 
-// Creates a new Client, with reasonable defaults
+// NewClient Creates a new Client, with reasonable defaults
 func NewClient(server string, opts ...ClientOption) (*Client, error) {
 	// create a client with sane default values
 	client := Client{
@@ -96,7 +159,94 @@ func NewClient(server string, opts ...ClientOption) (*Client, error) {
 	if client.Client == nil {
 		client.Client = http.DefaultClient
 	}
+
+	client.operationDoers = setupOperationDoers(&client, client.RoundTripMiddlewares)
+
 	return &client, nil
+}
+
+func setupOperationDoers(c *Client, rtMiddlewares RoundTripMiddlewares) *operationDoFunctions {
+
+	sharedMiddlewares := []RoundTripMiddleware{}
+
+	if c.RequestEditor != nil {
+		mw := newRequestEditorMiddleware(c.RequestEditor)
+		sharedMiddlewares = append(sharedMiddlewares, mw)
+	}
+
+	if c.SharedRoundTripMiddleware != nil {
+		sharedMiddlewares = append(sharedMiddlewares, c.SharedRoundTripMiddleware)
+	}
+
+	sharedMiddleware := joinMiddleware(sharedMiddlewares...)
+
+	operationDoers := operationDoFunctions{}
+
+	// EnsureEverythingIsReferenced
+	if rtMiddlewares.EnsureEverythingIsReferenced != nil {
+		mw := joinMiddleware(sharedMiddleware, rtMiddlewares.EnsureEverythingIsReferenced)
+		operationDoers.EnsureEverythingIsReferenced = mw.DoFn(c.Client.Do)
+	} else {
+		operationDoers.EnsureEverythingIsReferenced = sharedMiddleware.DoFn(c.Client.Do)
+	}
+	// Issue127
+	if rtMiddlewares.Issue127 != nil {
+		mw := joinMiddleware(sharedMiddleware, rtMiddlewares.Issue127)
+		operationDoers.Issue127 = mw.DoFn(c.Client.Do)
+	} else {
+		operationDoers.Issue127 = sharedMiddleware.DoFn(c.Client.Do)
+	}
+	// Issue30
+	if rtMiddlewares.Issue30 != nil {
+		mw := joinMiddleware(sharedMiddleware, rtMiddlewares.Issue30)
+		operationDoers.Issue30 = mw.DoFn(c.Client.Do)
+	} else {
+		operationDoers.Issue30 = sharedMiddleware.DoFn(c.Client.Do)
+	}
+	// Issue41
+	if rtMiddlewares.Issue41 != nil {
+		mw := joinMiddleware(sharedMiddleware, rtMiddlewares.Issue41)
+		operationDoers.Issue41 = mw.DoFn(c.Client.Do)
+	} else {
+		operationDoers.Issue41 = sharedMiddleware.DoFn(c.Client.Do)
+	}
+	// Issue9
+	if rtMiddlewares.Issue9 != nil {
+		mw := joinMiddleware(sharedMiddleware, rtMiddlewares.Issue9)
+		operationDoers.Issue9 = mw.DoFn(c.Client.Do)
+	} else {
+		operationDoers.Issue9 = sharedMiddleware.DoFn(c.Client.Do)
+	}
+
+	return &operationDoers
+}
+
+func newRequestEditorMiddleware(requestEditorFn RequestEditorFn) RoundTripMiddleware {
+	return func(next DoFn) DoFn {
+		return func(r *http.Request) (*http.Response, error) {
+			err := requestEditorFn(r.Context(), r)
+			if err != nil {
+				return nil, err
+			}
+			return next(r)
+		}
+	}
+}
+
+// WithSharedRoundTripMiddleware add a middleware that applies to all routes
+func WithSharedRoundTripMiddleware(rtm RoundTripMiddleware) ClientOption {
+	return func(c *Client) error {
+		c.SharedRoundTripMiddleware = rtm
+		return nil
+	}
+}
+
+// WithRoundTripMiddlewares Add middlewares that apply to specific routes
+func WithRoundTripMiddlewares(rtMiddlewares RoundTripMiddlewares) ClientOption {
+	return func(c *Client) error {
+		c.RoundTripMiddlewares = rtMiddlewares
+		return nil
+	}
 }
 
 // WithHTTPClient allows overriding the default Doer, which is
@@ -104,6 +254,18 @@ func NewClient(server string, opts ...ClientOption) (*Client, error) {
 func WithHTTPClient(doer HttpRequestDoer) ClientOption {
 	return func(c *Client) error {
 		c.Client = doer
+		return nil
+	}
+}
+
+// WithBaseURL overrides the baseURL.
+func WithBaseURL(baseURL string) ClientOption {
+	return func(c *Client) error {
+		newBaseURL, err := url.Parse(baseURL)
+		if err != nil {
+			return err
+		}
+		c.Server = newBaseURL.String()
 		return nil
 	}
 }
@@ -121,20 +283,33 @@ func WithRequestEditorFn(fn RequestEditorFn) ClientOption {
 type ClientInterface interface {
 	// EnsureEverythingIsReferenced request
 	EnsureEverythingIsReferenced(ctx context.Context) (*http.Response, error)
+	// EnsureEverythingIsReferencedWithResponse request  and parse response
+	EnsureEverythingIsReferencedWithResponse(ctx context.Context) (*EnsureEverythingIsReferencedResponse, error)
 
 	// Issue127 request
 	Issue127(ctx context.Context) (*http.Response, error)
+	// Issue127WithResponse request  and parse response
+	Issue127WithResponse(ctx context.Context) (*Issue127Response, error)
 
 	// Issue30 request
 	Issue30(ctx context.Context, pFallthrough string) (*http.Response, error)
+	// Issue30WithResponse request  and parse response
+	Issue30WithResponse(ctx context.Context, pFallthrough string) (*Issue30Response, error)
 
 	// Issue41 request
 	Issue41(ctx context.Context, n1param N5StartsWithNumber) (*http.Response, error)
+	// Issue41WithResponse request  and parse response
+	Issue41WithResponse(ctx context.Context, n1param N5StartsWithNumber) (*Issue41Response, error)
 
-	// Issue9 request  with any body
+	// Issue9WithBody request  with any body
 	Issue9WithBody(ctx context.Context, params *Issue9Params, contentType string, body io.Reader) (*http.Response, error)
+	// Issue9WithBodyWithResponse request  with any body and parse response
+	Issue9WithBodyWithResponse(ctx context.Context, params *Issue9Params, contentType string, body io.Reader) (*Issue9Response, error)
 
+	// Issue9
 	Issue9(ctx context.Context, params *Issue9Params, body Issue9JSONRequestBody) (*http.Response, error)
+	// Issue9WithResponse
+	Issue9WithResponse(ctx context.Context, params *Issue9Params, body Issue9JSONRequestBody) (*Issue9Response, error)
 }
 
 func (c *Client) EnsureEverythingIsReferenced(ctx context.Context) (*http.Response, error) {
@@ -143,13 +318,7 @@ func (c *Client) EnsureEverythingIsReferenced(ctx context.Context) (*http.Respon
 		return nil, err
 	}
 	req = req.WithContext(ctx)
-	if c.RequestEditor != nil {
-		err = c.RequestEditor(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return c.Client.Do(req)
+	return c.operationDoers.EnsureEverythingIsReferenced(req)
 }
 
 func (c *Client) Issue127(ctx context.Context) (*http.Response, error) {
@@ -158,13 +327,7 @@ func (c *Client) Issue127(ctx context.Context) (*http.Response, error) {
 		return nil, err
 	}
 	req = req.WithContext(ctx)
-	if c.RequestEditor != nil {
-		err = c.RequestEditor(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return c.Client.Do(req)
+	return c.operationDoers.Issue127(req)
 }
 
 func (c *Client) Issue30(ctx context.Context, pFallthrough string) (*http.Response, error) {
@@ -173,13 +336,7 @@ func (c *Client) Issue30(ctx context.Context, pFallthrough string) (*http.Respon
 		return nil, err
 	}
 	req = req.WithContext(ctx)
-	if c.RequestEditor != nil {
-		err = c.RequestEditor(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return c.Client.Do(req)
+	return c.operationDoers.Issue30(req)
 }
 
 func (c *Client) Issue41(ctx context.Context, n1param N5StartsWithNumber) (*http.Response, error) {
@@ -188,13 +345,7 @@ func (c *Client) Issue41(ctx context.Context, n1param N5StartsWithNumber) (*http
 		return nil, err
 	}
 	req = req.WithContext(ctx)
-	if c.RequestEditor != nil {
-		err = c.RequestEditor(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return c.Client.Do(req)
+	return c.operationDoers.Issue41(req)
 }
 
 func (c *Client) Issue9WithBody(ctx context.Context, params *Issue9Params, contentType string, body io.Reader) (*http.Response, error) {
@@ -203,13 +354,7 @@ func (c *Client) Issue9WithBody(ctx context.Context, params *Issue9Params, conte
 		return nil, err
 	}
 	req = req.WithContext(ctx)
-	if c.RequestEditor != nil {
-		err = c.RequestEditor(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return c.Client.Do(req)
+	return c.operationDoers.Issue9(req)
 }
 
 func (c *Client) Issue9(ctx context.Context, params *Issue9Params, body Issue9JSONRequestBody) (*http.Response, error) {
@@ -218,13 +363,7 @@ func (c *Client) Issue9(ctx context.Context, params *Issue9Params, body Issue9JS
 		return nil, err
 	}
 	req = req.WithContext(ctx)
-	if c.RequestEditor != nil {
-		err = c.RequestEditor(ctx, req)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return c.Client.Do(req)
+	return c.operationDoers.Issue9(req)
 }
 
 // NewEnsureEverythingIsReferencedRequest generates requests for EnsureEverythingIsReferenced
@@ -404,34 +543,7 @@ func NewIssue9RequestWithBody(server string, params *Issue9Params, contentType s
 	return req, nil
 }
 
-// ClientWithResponses builds on ClientInterface to offer response payloads
-type ClientWithResponses struct {
-	ClientInterface
-}
-
-// NewClientWithResponses creates a new ClientWithResponses, which wraps
-// Client with return type handling
-func NewClientWithResponses(server string, opts ...ClientOption) (*ClientWithResponses, error) {
-	client, err := NewClient(server, opts...)
-	if err != nil {
-		return nil, err
-	}
-	return &ClientWithResponses{client}, nil
-}
-
-// WithBaseURL overrides the baseURL.
-func WithBaseURL(baseURL string) ClientOption {
-	return func(c *Client) error {
-		newBaseURL, err := url.Parse(baseURL)
-		if err != nil {
-			return err
-		}
-		c.Server = newBaseURL.String()
-		return nil
-	}
-}
-
-type ensureEverythingIsReferencedResponse struct {
+type EnsureEverythingIsReferencedResponse struct {
 	Body         []byte
 	HTTPResponse *http.Response
 	JSON200      *struct {
@@ -444,7 +556,7 @@ type ensureEverythingIsReferencedResponse struct {
 }
 
 // Status returns HTTPResponse.Status
-func (r ensureEverythingIsReferencedResponse) Status() string {
+func (r EnsureEverythingIsReferencedResponse) Status() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Status
 	}
@@ -452,14 +564,14 @@ func (r ensureEverythingIsReferencedResponse) Status() string {
 }
 
 // StatusCode returns HTTPResponse.StatusCode
-func (r ensureEverythingIsReferencedResponse) StatusCode() int {
+func (r EnsureEverythingIsReferencedResponse) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
 	return 0
 }
 
-type issue127Response struct {
+type Issue127Response struct {
 	Body         []byte
 	HTTPResponse *http.Response
 	JSON200      *GenericObject
@@ -469,7 +581,7 @@ type issue127Response struct {
 }
 
 // Status returns HTTPResponse.Status
-func (r issue127Response) Status() string {
+func (r Issue127Response) Status() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Status
 	}
@@ -477,20 +589,20 @@ func (r issue127Response) Status() string {
 }
 
 // StatusCode returns HTTPResponse.StatusCode
-func (r issue127Response) StatusCode() int {
+func (r Issue127Response) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
 	return 0
 }
 
-type issue30Response struct {
+type Issue30Response struct {
 	Body         []byte
 	HTTPResponse *http.Response
 }
 
 // Status returns HTTPResponse.Status
-func (r issue30Response) Status() string {
+func (r Issue30Response) Status() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Status
 	}
@@ -498,20 +610,20 @@ func (r issue30Response) Status() string {
 }
 
 // StatusCode returns HTTPResponse.StatusCode
-func (r issue30Response) StatusCode() int {
+func (r Issue30Response) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
 	return 0
 }
 
-type issue41Response struct {
+type Issue41Response struct {
 	Body         []byte
 	HTTPResponse *http.Response
 }
 
 // Status returns HTTPResponse.Status
-func (r issue41Response) Status() string {
+func (r Issue41Response) Status() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Status
 	}
@@ -519,20 +631,20 @@ func (r issue41Response) Status() string {
 }
 
 // StatusCode returns HTTPResponse.StatusCode
-func (r issue41Response) StatusCode() int {
+func (r Issue41Response) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
 	return 0
 }
 
-type issue9Response struct {
+type Issue9Response struct {
 	Body         []byte
 	HTTPResponse *http.Response
 }
 
 // Status returns HTTPResponse.Status
-func (r issue9Response) Status() string {
+func (r Issue9Response) Status() string {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.Status
 	}
@@ -540,7 +652,7 @@ func (r issue9Response) Status() string {
 }
 
 // StatusCode returns HTTPResponse.StatusCode
-func (r issue9Response) StatusCode() int {
+func (r Issue9Response) StatusCode() int {
 	if r.HTTPResponse != nil {
 		return r.HTTPResponse.StatusCode
 	}
@@ -548,7 +660,7 @@ func (r issue9Response) StatusCode() int {
 }
 
 // EnsureEverythingIsReferencedWithResponse request returning *EnsureEverythingIsReferencedResponse
-func (c *ClientWithResponses) EnsureEverythingIsReferencedWithResponse(ctx context.Context) (*ensureEverythingIsReferencedResponse, error) {
+func (c *Client) EnsureEverythingIsReferencedWithResponse(ctx context.Context) (*EnsureEverythingIsReferencedResponse, error) {
 	rsp, err := c.EnsureEverythingIsReferenced(ctx)
 	if err != nil {
 		return nil, err
@@ -557,7 +669,7 @@ func (c *ClientWithResponses) EnsureEverythingIsReferencedWithResponse(ctx conte
 }
 
 // Issue127WithResponse request returning *Issue127Response
-func (c *ClientWithResponses) Issue127WithResponse(ctx context.Context) (*issue127Response, error) {
+func (c *Client) Issue127WithResponse(ctx context.Context) (*Issue127Response, error) {
 	rsp, err := c.Issue127(ctx)
 	if err != nil {
 		return nil, err
@@ -566,7 +678,7 @@ func (c *ClientWithResponses) Issue127WithResponse(ctx context.Context) (*issue1
 }
 
 // Issue30WithResponse request returning *Issue30Response
-func (c *ClientWithResponses) Issue30WithResponse(ctx context.Context, pFallthrough string) (*issue30Response, error) {
+func (c *Client) Issue30WithResponse(ctx context.Context, pFallthrough string) (*Issue30Response, error) {
 	rsp, err := c.Issue30(ctx, pFallthrough)
 	if err != nil {
 		return nil, err
@@ -575,7 +687,7 @@ func (c *ClientWithResponses) Issue30WithResponse(ctx context.Context, pFallthro
 }
 
 // Issue41WithResponse request returning *Issue41Response
-func (c *ClientWithResponses) Issue41WithResponse(ctx context.Context, n1param N5StartsWithNumber) (*issue41Response, error) {
+func (c *Client) Issue41WithResponse(ctx context.Context, n1param N5StartsWithNumber) (*Issue41Response, error) {
 	rsp, err := c.Issue41(ctx, n1param)
 	if err != nil {
 		return nil, err
@@ -584,7 +696,7 @@ func (c *ClientWithResponses) Issue41WithResponse(ctx context.Context, n1param N
 }
 
 // Issue9WithBodyWithResponse request with arbitrary body returning *Issue9Response
-func (c *ClientWithResponses) Issue9WithBodyWithResponse(ctx context.Context, params *Issue9Params, contentType string, body io.Reader) (*issue9Response, error) {
+func (c *Client) Issue9WithBodyWithResponse(ctx context.Context, params *Issue9Params, contentType string, body io.Reader) (*Issue9Response, error) {
 	rsp, err := c.Issue9WithBody(ctx, params, contentType, body)
 	if err != nil {
 		return nil, err
@@ -592,7 +704,7 @@ func (c *ClientWithResponses) Issue9WithBodyWithResponse(ctx context.Context, pa
 	return ParseIssue9Response(rsp)
 }
 
-func (c *ClientWithResponses) Issue9WithResponse(ctx context.Context, params *Issue9Params, body Issue9JSONRequestBody) (*issue9Response, error) {
+func (c *Client) Issue9WithResponse(ctx context.Context, params *Issue9Params, body Issue9JSONRequestBody) (*Issue9Response, error) {
 	rsp, err := c.Issue9(ctx, params, body)
 	if err != nil {
 		return nil, err
@@ -601,14 +713,14 @@ func (c *ClientWithResponses) Issue9WithResponse(ctx context.Context, params *Is
 }
 
 // ParseEnsureEverythingIsReferencedResponse parses an HTTP response from a EnsureEverythingIsReferencedWithResponse call
-func ParseEnsureEverythingIsReferencedResponse(rsp *http.Response) (*ensureEverythingIsReferencedResponse, error) {
+func ParseEnsureEverythingIsReferencedResponse(rsp *http.Response) (*EnsureEverythingIsReferencedResponse, error) {
 	bodyBytes, err := ioutil.ReadAll(rsp.Body)
 	defer rsp.Body.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	response := &ensureEverythingIsReferencedResponse{
+	response := &EnsureEverythingIsReferencedResponse{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}
@@ -633,14 +745,14 @@ func ParseEnsureEverythingIsReferencedResponse(rsp *http.Response) (*ensureEvery
 }
 
 // ParseIssue127Response parses an HTTP response from a Issue127WithResponse call
-func ParseIssue127Response(rsp *http.Response) (*issue127Response, error) {
+func ParseIssue127Response(rsp *http.Response) (*Issue127Response, error) {
 	bodyBytes, err := ioutil.ReadAll(rsp.Body)
 	defer rsp.Body.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	response := &issue127Response{
+	response := &Issue127Response{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}
@@ -686,14 +798,14 @@ func ParseIssue127Response(rsp *http.Response) (*issue127Response, error) {
 }
 
 // ParseIssue30Response parses an HTTP response from a Issue30WithResponse call
-func ParseIssue30Response(rsp *http.Response) (*issue30Response, error) {
+func ParseIssue30Response(rsp *http.Response) (*Issue30Response, error) {
 	bodyBytes, err := ioutil.ReadAll(rsp.Body)
 	defer rsp.Body.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	response := &issue30Response{
+	response := &Issue30Response{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}
@@ -705,14 +817,14 @@ func ParseIssue30Response(rsp *http.Response) (*issue30Response, error) {
 }
 
 // ParseIssue41Response parses an HTTP response from a Issue41WithResponse call
-func ParseIssue41Response(rsp *http.Response) (*issue41Response, error) {
+func ParseIssue41Response(rsp *http.Response) (*Issue41Response, error) {
 	bodyBytes, err := ioutil.ReadAll(rsp.Body)
 	defer rsp.Body.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	response := &issue41Response{
+	response := &Issue41Response{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}
@@ -724,14 +836,14 @@ func ParseIssue41Response(rsp *http.Response) (*issue41Response, error) {
 }
 
 // ParseIssue9Response parses an HTTP response from a Issue9WithResponse call
-func ParseIssue9Response(rsp *http.Response) (*issue9Response, error) {
+func ParseIssue9Response(rsp *http.Response) (*Issue9Response, error) {
 	bodyBytes, err := ioutil.ReadAll(rsp.Body)
 	defer rsp.Body.Close()
 	if err != nil {
 		return nil, err
 	}
 
-	response := &issue9Response{
+	response := &Issue9Response{
 		Body:         bodyBytes,
 		HTTPResponse: rsp,
 	}
