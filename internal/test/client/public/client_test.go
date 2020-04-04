@@ -75,14 +75,14 @@ func TestSharedRoundTripMiddleware(t *testing.T) {
 		Once()
 	interceptor.On("After", mock.Anything).Once()
 
-	clientWithResponses, err := NewClientWithResponses(
+	client, err := NewClient(
 		"https://my-url.com",
 		WithHTTPClient(httpClient),
 		WithSharedRoundTripMiddleware(newInterceptMiddleware(interceptor)),
 	)
 	require.NoError(t, err)
 
-	resp, err := clientWithResponses.GetBothWithResponse(context.TODO())
+	resp, err := client.GetBothWithResponse(context.TODO())
 	require.NoError(t, err)
 
 	assert.Equal(t, "some-role", resp.JSON200.Role)
@@ -121,7 +121,7 @@ func TestOperationRoundTripMiddleware(t *testing.T) {
 		// interceptor.On("Before", mock.Anything).Once()
 		// interceptor.On("After", mock.Anything).Once()
 
-		clientWithResponses, err := NewClientWithResponses(
+		client, err := NewClient(
 			"https://my-url.com",
 			WithHTTPClient(httpClient),
 			WithRoundTripMiddlewares(RoundTripMiddlewares{
@@ -130,7 +130,7 @@ func TestOperationRoundTripMiddleware(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		resp, err := clientWithResponses.GetBothWithResponse(context.TODO())
+		resp, err := client.GetBothWithResponse(context.TODO())
 		require.NoError(t, err)
 		assert.Equal(t, "some-role", resp.JSON200.Role)
 		assert.Equal(t, "first-name", resp.JSON200.FirstName)
@@ -148,7 +148,7 @@ func TestOperationRoundTripMiddleware(t *testing.T) {
 		interceptor.On("Before", mock.Anything).Once()
 		interceptor.On("After", mock.Anything).Once()
 
-		clientWithResponses, err := NewClientWithResponses(
+		client, err := NewClient(
 			"https://my-url.com",
 			WithHTTPClient(httpClient),
 			WithRoundTripMiddlewares(RoundTripMiddlewares{
@@ -157,7 +157,7 @@ func TestOperationRoundTripMiddleware(t *testing.T) {
 		)
 		require.NoError(t, err)
 
-		resp, err := clientWithResponses.GetBothWithResponse(context.TODO())
+		resp, err := client.GetBothWithResponse(context.TODO())
 		require.NoError(t, err)
 
 		assert.Equal(t, "some-role", resp.JSON200.Role)

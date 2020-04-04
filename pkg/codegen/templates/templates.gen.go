@@ -275,9 +275,9 @@ func {{$opid}}Ctx(next http.Handler) http.Handler {
 {{$newClientFn := "NewClient" -}}
 {{$clientOption := "ClientOption" -}}
 {{if .MakeClientPrivate}}
-    {{$clientStruct = "client" -}}
-    {{$clientInterface = "clientInterface" -}}
-    {{$newClientFn = "newClient" -}}
+    {{$clientStruct = "generatedClient" -}}
+    {{$clientInterface = "generatedClientInterface" -}}
+    {{$newClientFn = "newGeneratedClient" -}}
     {{$clientOption = "clientOption" -}}
 {{end}}
 
@@ -356,15 +356,14 @@ func Parse{{genResponseTypeName $opid | ucFirst}}(rsp *http.Response) (*{{genRes
 {{end}}{{/* range .Operations $opid := .OperationId */}}
 
 `,
-	"client.tmpl": `
-{{$clientStruct := "Client" -}}
+	"client.tmpl": `{{$clientStruct := "Client" -}}
 {{$clientInterface := "ClientInterface" -}}
 {{$newClientFn := "NewClient" -}}
 {{$clientOption := "ClientOption" -}}
 {{if .MakeClientPrivate}}
-    {{$clientStruct = "client" -}}
-    {{$clientInterface = "clientInterface" -}}
-    {{$newClientFn = "newClient" -}}
+    {{$clientStruct = "generatedClient" -}}
+    {{$clientInterface = "generatedClientInterface" -}}
+    {{$newClientFn = "newGeneratedClient" -}}
     {{$clientOption = "clientOption" -}}
 {{end}}
 
@@ -527,7 +526,7 @@ func newRequestEditorMiddleware(requestEditorFn RequestEditorFn) RoundTripMiddle
 
 // WithSharedRoundTripMiddleware add a middleware that applies to all routes
 func WithSharedRoundTripMiddleware(rtm RoundTripMiddleware) {{$clientOption}} {
-	return func(c *Client) error {
+	return func(c *{{$clientStruct}}) error {
 		c.SharedRoundTripMiddleware = rtm
 		return nil
 	}
@@ -535,7 +534,7 @@ func WithSharedRoundTripMiddleware(rtm RoundTripMiddleware) {{$clientOption}} {
 
 // WithRoundTripMiddlewares Add middlewares that apply to specific routes
 func WithRoundTripMiddlewares(rtMiddlewares RoundTripMiddlewares) {{$clientOption}} {
-	return func(c *Client) error {
+	return func(c *{{$clientStruct}}) error {
 		c.RoundTripMiddlewares = rtMiddlewares
 		return nil
 	}
